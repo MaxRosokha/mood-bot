@@ -4,8 +4,9 @@ import sys
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from typing import Callable, Dict, Any, Awaitable
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -23,8 +24,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Отримуємо список дозволених ID
+# Формат в .env: ALLOWED_USERS=123456,987654 (через кому)
+allowed_users_env = os.getenv("ALLOWED_USERS", "")
+# Перетворюємо рядок "123,456" у список чисел [123, 456]
+ALLOWED_IDS = [int(x.strip()) for x in allowed_users_env.split(",") if x.strip()]
+
 if not BOT_TOKEN or not GEMINI_API_KEY:
-    print("❌ Помилка: Перевірте .env файл (BOT_TOKEN або GEMINI_API_KEY відсутні)")
+    print("❌ Помилка: Перевірте .env файл")
     sys.exit(1)
 
 # Налаштування Gemini
@@ -44,7 +51,32 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# --- СТАНИ (FSM) ---
+# --- MIDDLEWARE (ФЕЙС-КОНТРОЛЬ) ---
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: types.TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        
+        # Якщо список пустий - пускаємо всіх (режим розробки)
+        # Якщо список не пустий - перевіряємо ID
+        if user and ALLOWED_IDS and user.id not in ALLOWED_IDS:
+            print(f"⛔️ Блокування доступу для: {user.first_name} (ID: {user.id})")
+            # Можна відповісти користувачу, що доступ заборонено
+            if isinstance(event, types.Message):
+                await event.answer(f"🔒 Вибач, це приватний бот.\nТвій ID: <code>{user.id}</code>\nНадішли цей код власнику, щоб отримати доступ.", parse_mode="HTML")
+            return # Зупиняємо обробку, далі код не піде
+            
+        return await handler(event, data)
+
+# Реєструємо middleware
+dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
+
+# --- СТАНИ ---
 class MoodInteraction(StatesGroup):
     waiting_for_note = State()
 
@@ -64,7 +96,6 @@ def init_db():
     conn.close()
 
 def get_all_users():
-    """Отримує список ID всіх користувачів для розсилки"""
     conn = sqlite3.connect('mood.db')
     c = conn.cursor()
     c.execute("SELECT user_id FROM users")
@@ -140,11 +171,13 @@ def get_skip_note_keyboard():
 
 # --- Розклад (Scheduler) ---
 async def daily_morning_checkin(bot: Bot):
-    """Ця функція запускається автоматично щоранку"""
     users = get_all_users()
     print(f"⏰ Починаю ранкову розсилку для {len(users)} користувачів...")
-    
     for user_id in users:
+        # Перевірка чи користувач дозволений (про всяк випадок)
+        if ALLOWED_IDS and user_id not in ALLOWED_IDS:
+            continue
+            
         try:
             await bot.send_message(
                 user_id, 
@@ -155,7 +188,7 @@ async def daily_morning_checkin(bot: Bot):
         except Exception as e:
             print(f"Не вдалося надіслати повідомлення користувачу {user_id}: {e}")
 
-# 4. Обробники (Handlers)
+# 4. Обробники
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     conn = sqlite3.connect('mood.db')
@@ -278,16 +311,18 @@ async def get_ai_advice(callback: types.CallbackQuery):
         await msg.edit_text(f"Помилка AI: {str(e)}", reply_markup=get_main_keyboard())
     await callback.answer()
 
-# Запуск
 async def main():
     init_db()
-    
-    # --- НАЛАШТУВАННЯ ПЛАНУВАЛЬНИКА ---
-    scheduler = AsyncIOScheduler(timezone='Europe/Kyiv') # Встановіть ваш часовий пояс
-    # Запускаємо о 9:00 ранку
+    # 9:00 ранку
+    scheduler = AsyncIOScheduler(timezone='Europe/Kyiv')
     scheduler.add_job(daily_morning_checkin, trigger='cron', hour=9, minute=0, args=[bot])
     scheduler.start()
     
+    if not ALLOWED_IDS:
+        print("⚠️ УВАГА! Список дозволених користувачів пустий. Бот доступний ВСІМ.")
+    else:
+        print(f"🔒 Приватний режим. Доступ мають: {ALLOWED_IDS}")
+        
     print("Бот і Планувальник запущені...")
     await dp.start_polling(bot)
 
